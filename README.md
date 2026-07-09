@@ -84,8 +84,8 @@ Object node (tag=0x10), Value = child1 + child2 = 9 + 7 = 16 bytes
 ### 编译运行示例
 
 ```bash
-g++ -std=c++11 tlv_test.cpp -o tlv_test
-./tlv_test
+g++ -std=c++11 test.cpp -o test
+./test
 ```
 
 ### 组装（Builder）
