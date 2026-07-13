@@ -11,23 +11,22 @@
 *   修改后 TAG_LENGTH / LEN_LENGTH / VALUE_MAX_LENGTH 等常量及所有读写逻辑
 *   通过模板特化自动适配，无需改动其他代码。
 *   需多种 TLV 共存时，复制本文件并改名 namespace 即可（详见 README）。
-* @copyright Copyright (c) 2026 qianshuo. Licensed under the MIT License.
+* @copyright 
 */
 
 #pragma once
 
-#include <vector>
 #include <cstring>
 #include <array>
 #include <cstdint>
 #include <string>
 #include <limits>
-#include <stdexcept>
+#include <new>       // std::nothrow
 
 namespace TLVView {
     /// @brief Tag 与 Length 的字段类型配置。置于命名空间内，便于复制重命名头文件支持多种 TLV。
     /// @details 复制本文件改名为 TLVView2.h 并把 namespace 改为 TLVView2 后，
-    ///          TLVView::TagType 与 TLVView2::TagType 分属不同命名空间，可同程序共存不冲突。
+    ///          TagType 与 TLVView2::TagType 分属不同命名空间，可同程序共存不冲突。
     ///          不使用模板参数指定 Tag/Length 类型：通常一个程序中很少涉及多种 TLV 结构，
     ///          直接修改此 using 定义最简单；使用模板会让所有节点类都带上模板参数，更加繁琐。
     using TagType    = uint8_t;
@@ -111,6 +110,69 @@ namespace TLVView {
         size_t      m_size;
     };
 
+    /**
+     * @brief 轻量内存缓冲区（C++11 兼容，零异常）。
+     * @details 拥有一块通过 operator new(std::nothrow) 分配的内存，析构时释放。
+     *          分配失败不抛异常，构造为空对象（IsValid()==false）。
+     *          仅支持移动语义，不可拷贝。用于 Builder::Serialize() 的无异常返回值。
+     */
+    class MemoryBuffer {
+    public:
+        /// @brief 构造空缓冲区（无效态）
+        MemoryBuffer() : m_data(nullptr), m_size(0) {}
+
+        /// @brief 析构释放内存
+        ~MemoryBuffer() {
+            ::operator delete(m_data);
+        }
+
+        /// @brief 移动构造，转移所有权
+        MemoryBuffer(MemoryBuffer&& other) noexcept
+            : m_data(other.m_data), m_size(other.m_size) {
+            other.m_data = nullptr;
+            other.m_size = 0;
+        }
+
+        /// @brief 移动赋值，转移所有权
+        MemoryBuffer& operator=(MemoryBuffer&& other) noexcept {
+            if (this != &other) {
+                ::operator delete(m_data);
+                m_data = other.m_data;
+                m_size = other.m_size;
+                other.m_data = nullptr;
+                other.m_size = 0;
+            }
+            return *this;
+        }
+
+        /// @brief 禁止拷贝
+        MemoryBuffer(const MemoryBuffer&) = delete;
+        MemoryBuffer& operator=(const MemoryBuffer&) = delete;
+
+        /// @brief 工厂方法：分配 size 字节，失败返回无效态对象（不抛异常）
+        static MemoryBuffer Create(size_t size) {
+            MemoryBuffer buf;
+            if (size == 0)
+                return buf;  // 0 字节视为无效，避免分配
+            buf.m_data = static_cast<uint8_t*>(::operator new(size, std::nothrow));
+            if (buf.m_data)
+                buf.m_size = size;
+            return buf;
+        }
+
+        /// @brief 分配是否成功
+        bool        IsValid() const { return m_data != nullptr; }
+        /// @brief 数据指针（未分配时为 nullptr）
+        uint8_t*    data()        { return m_data; }
+        const uint8_t* data() const { return m_data; }
+        /// @brief 数据字节数（未分配时为 0）
+        size_t      size()  const { return m_size; }
+
+    private:
+        uint8_t* m_data;
+        size_t   m_size;
+    };
+
     namespace Builder {
     /**
      * @brief Node 基类，不可实例化
@@ -121,11 +183,15 @@ namespace TLVView {
         virtual ~NodeBase() = default;
         TagType GetTag() const { return m_tag; }
 
-        /// @brief 序列化为 vector（零拷贝写入，内部分配）
-        std::vector<uint8_t> Serialize() const {
+        /// @brief 序列化为 MemoryBuffer（零拷贝写入，内部分配，无异常）
+        /// @details 内部用 operator new(std::nothrow) 分配内存，失败时返回
+        ///          IsValid()==false 的空对象（不抛异常）。
+        ///          调用方须检查返回值的 IsValid()。
+        MemoryBuffer Serialize() const {
             size_t totalLen = CalcTotalSize();
-            std::vector<uint8_t> buf(totalLen);
-            Write(buf.data());
+            MemoryBuffer buf = MemoryBuffer::Create(totalLen);
+            if (buf.IsValid())
+                Write(buf.data());
             return buf;
         }
 
@@ -157,11 +223,11 @@ namespace TLVView {
     class NodeObject :public NodeBase {
     public:
         // 修改：只接收 tag，稍后通过 AddChild 添加子节点
-        explicit NodeObject(uint8_t tag) : NodeBase(tag) {}
+        explicit NodeObject(uint8_t tag) : NodeBase(tag), m_children{} {}
         bool AddChild(const NodeBase* pChild) {
-            for (auto& c : m_children) {
-                if (c == nullptr) {
-                    c = pChild;
+            for (size_t i = 0; i < N; ++i) {
+                if (m_children[i] == nullptr) {
+                    m_children[i] = pChild;
                     return true;
                 }
             }
@@ -177,14 +243,14 @@ namespace TLVView {
     private:
         std::array<const NodeBase*, N> m_children{};   // 值初始化为 nullptr
         size_t CalcTotalSize() const override {
-            return TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + CalcPayloadSize();
+            return TAG_LENGTH + LEN_LENGTH + CalcPayloadSize();
         }
         uint8_t* Write(uint8_t* buf) const override {
             size_t payloadSize = CalcPayloadSize();
             // tag
-            buf = TLVView::BufferWriteValue(buf, m_tag);
+            buf = BufferWriteValue(buf, m_tag);
             // length
-            buf = TLVView::BufferWriteValue(buf, static_cast<uint32_t>(payloadSize));
+            buf = BufferWriteValue(buf, static_cast<uint32_t>(payloadSize));
             // value
             for (const auto& c : m_children) {
                 if (c && c->IsValid())
@@ -211,15 +277,15 @@ namespace TLVView {
     private:
         uint32_t m_value;
         size_t CalcTotalSize() const override {
-            return TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + sizeof(m_value);
+            return TAG_LENGTH + LEN_LENGTH + sizeof(m_value);
         }
         uint8_t* Write(uint8_t* buf) const override {
             // tag
-            buf = TLVView::BufferWriteValue(buf, m_tag);
+            buf = BufferWriteValue(buf, m_tag);
             // length
-            buf = TLVView::BufferWriteValue(buf, (uint32_t)sizeof(uint32_t));
+            buf = BufferWriteValue(buf, (uint32_t)sizeof(uint32_t));
             // value
-            buf = TLVView::BufferWriteValue(buf, m_value);
+            buf = BufferWriteValue(buf, m_value);
             return buf;
         }
     };
@@ -231,8 +297,10 @@ namespace TLVView {
     public:
         NodeBinary(uint8_t tag, const uint8_t* data, size_t length)
             : NodeBase(tag), m_pData(data), m_szLen(length) {
-            if (m_szLen > TLVView::VALUE_MAX_LENGTH)
-                throw std::runtime_error("TLVView::Builder::NodeBinary: length exceeds max limit");
+            if (m_szLen > VALUE_MAX_LENGTH) {
+                m_pData = nullptr;  // 无效态
+                m_szLen = 0;
+            }
         }
 
         bool IsValid() const override {
@@ -242,13 +310,13 @@ namespace TLVView {
         const uint8_t* m_pData;
         size_t           m_szLen;
         size_t CalcTotalSize() const override {
-            return TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + m_szLen;
+            return TAG_LENGTH + LEN_LENGTH + m_szLen;
         }
         uint8_t* Write(uint8_t* buf) const override {
             // tag
-            buf = TLVView::BufferWriteValue(buf, m_tag);
+            buf = BufferWriteValue(buf, m_tag);
             // length
-            buf = TLVView::BufferWriteValue(buf, static_cast<uint32_t>(m_szLen));
+            buf = BufferWriteValue(buf, static_cast<uint32_t>(m_szLen));
             // value
             std::memcpy(buf, m_pData, m_szLen);
             buf += m_szLen;
@@ -267,7 +335,7 @@ namespace TLVView {
         }
 
         /// @brief 从 StringView 构造（零拷贝视图，引用的 buffer 须覆盖 Serialize 调用）
-        NodeString(uint8_t tag, const TLVView::StringView& sv)
+        NodeString(uint8_t tag, const StringView& sv)
             : NodeBinary(tag, reinterpret_cast<const uint8_t*>(sv.data()), sv.size()) {
         }
     };
@@ -281,7 +349,7 @@ namespace TLVView {
     class NodeString;
     class NodeObject;
 
-    /// @brief StringView 已提取至 TLVView 命名空间，此处直接复用 TLVView::StringView
+    /// @brief StringView 已提取至 TLVView 命名空间，此处直接复用 StringView
 
     /**
      * @brief 节点基类 — 内存视图，不拷贝数据。
@@ -298,16 +366,20 @@ namespace TLVView {
          */
         explicit NodeBase(const uint8_t* buffer, size_t totalLen)
             : m_pValue(nullptr), m_length(0), m_tag(0) {
-            if (totalLen < TLVView::TAG_LENGTH + TLVView::LEN_LENGTH)
-                throw std::runtime_error("TLVView::Extractor::NodeBase: buffer too small for header");
-            buffer = TLVView::BufferReadValue(buffer, m_tag);            // 读 tag
-            buffer = TLVView::BufferReadValue(buffer, m_length);          // 读 length
+            if (totalLen < TAG_LENGTH + LEN_LENGTH)
+                return;  // 无效 buffer，保持无效态
+            buffer = BufferReadValue(buffer, m_tag);            // 读 tag
+            buffer = BufferReadValue(buffer, m_length);          // 读 length
             // 校验 m_length 不超出实际剩余字节，防止后续遍历越界读
-            if (m_length > totalLen - TLVView::TAG_LENGTH - TLVView::LEN_LENGTH)
-                throw std::runtime_error("TLVView::Extractor::NodeBase: declared length exceeds buffer");
+            if (m_length > totalLen - TAG_LENGTH - LEN_LENGTH) {
+                m_pValue = nullptr;  // 无效态，抑制后续访问
+                return;
+            }
             m_pValue = buffer;
         }
 
+        /// @brief 构造成功后返回 true；若 buffer 数据不完整/格式错误则为 false
+        bool        IsValid()   const { return m_pValue != nullptr; }
         TagType     GetTag()    const { return m_tag; }
         const uint8_t* GetValue()  const { return m_pValue; }
         LengthType  GetLength() const { return m_length; }
@@ -332,18 +404,27 @@ namespace TLVView {
         NodeUint32() : NodeBase(), m_value(0) {}
 
         explicit NodeUint32(const uint8_t* buffer, size_t totalLen)
-            : NodeBase(buffer, totalLen) {
-            if (m_length < sizeof(uint32_t))
-                throw std::runtime_error("TLVView::Extractor::NodeUint32: value too short");
-            TLVView::BufferReadValue(m_pValue, m_value);
+            : NodeBase(buffer, totalLen), m_value(0) {
+            if (!NodeBase::IsValid() || m_length < sizeof(uint32_t)) {
+                m_pValue = nullptr;  // 抑制无效态
+                return;
+            }
+            BufferReadValue(m_pValue, m_value);
         }
 
         /// @brief 从 NodeBase 视图构造，复用已解析的 tag/length/value 指针
         NodeUint32(const NodeBase& other)
-            : NodeBase(other) {
-            if (m_length < sizeof(uint32_t))
-                throw std::runtime_error("TLVView::Extractor::NodeUint32: value too short");
-            TLVView::BufferReadValue(m_pValue, m_value);
+            : NodeBase(other), m_value(0) {
+            if (!NodeBase::IsValid() || m_length < sizeof(uint32_t)) {
+                m_pValue = nullptr;
+                return;
+            }
+            BufferReadValue(m_pValue, m_value);
+        }
+
+        /// @brief 构造成功且 value 长度满足 uint32 要求时返回 true
+        bool IsValid() const {
+            return NodeBase::IsValid() && m_length >= sizeof(uint32_t);
         }
 
         uint32_t GetValue() const { return m_value; }
@@ -364,9 +445,6 @@ namespace TLVView {
 
         /// @brief 从 NodeBase 视图构造
         NodeBinary(const NodeBase& other) : NodeBase(other) {}
-
-        const uint8_t* GetData()      const { return m_pValue; }
-        LengthType  GetDataLength() const { return m_length; }
     };
 
     /**
@@ -384,8 +462,8 @@ namespace TLVView {
         NodeString(const NodeBase& other) : NodeBase(other) {}
 
         /// @brief 零拷贝字符串视图
-        TLVView::StringView GetStringView() const {
-            return TLVView::StringView(reinterpret_cast<const char*>(m_pValue), m_length);
+        StringView GetStringView() const {
+            return StringView(reinterpret_cast<const char*>(m_pValue), m_length);
         }
 
         /// @brief 拷贝出 std::string
@@ -423,21 +501,18 @@ namespace TLVView {
 
         /**
          * @brief 获取第 index 个子节点（不按 tag 过滤），用于未知 tag 情况下的顺序遍历。
-         * @param outChild 输出节点（栈上预定义）
-         * @param index    要获取的子节点序号（0 基）
-         * @return true 表示找到并解析成功
+         * @param index 要获取的子节点序号（0 基）
+         * @return 解析成功的子节点视图；index 越界或数据不完整时返回无效态（IsValid()==false）
          */
-        bool GetChild(NodeBase& outChild, size_t index) const {
+        NodeBase GetChildAt(size_t index) const {
             size_t offset = 0;
             size_t curIndex = 0;
             while (NextChildOffset(offset)) {
-                if (curIndex == index) {
-                    outChild = NodeBase(m_pValue + offset, m_length - offset);
-                    return true;
-                }
+                if (curIndex == index)
+                    return NodeBase(m_pValue + offset, m_length - offset);
                 ++curIndex;
             }
-            return false;
+            return NodeBase();  // 无效态
         }
 
         /**
@@ -482,50 +557,33 @@ namespace TLVView {
 
         /**
          * @brief 获取 uint32 子节点。
-         * @param outChild 输出节点（栈上预定义）
-         * @param tag      要匹配的 tag
-         * @param index    当存在多个相同 tag 时，指定获取第几个（0 基）
-         * @return true 表示找到并解析成功
+         * @param tag   要匹配的 tag
+         * @param index 当存在多个相同 tag 时，指定获取第几个（0 基）
+         * @return 解析成功的子节点；未找到或 value 长度不足时返回无效态（IsValid()==false）
          */
-        bool GetChild(NodeUint32& outChild, TagType tag, size_t index = 0) const {
-            NodeBase base;
-            if (!FindChild(base, tag, index))
-                return false;
-            outChild = base.AsNodeUint32();
-            return true;
+        NodeUint32 GetChildUint32(TagType tag, size_t index = 0) const {
+            return FindChild(tag, index).AsNodeUint32();
         }
 
         /**
          * @brief 获取 Binary 子节点。
          */
-        bool GetChild(NodeBinary& outChild, TagType tag, size_t index = 0) const {
-            NodeBase base;
-            if (!FindChild(base, tag, index))
-                return false;
-            outChild = base.AsNodeBinary();
-            return true;
+        NodeBinary GetChildBinary(TagType tag, size_t index = 0) const {
+            return FindChild(tag, index).AsNodeBinary();
         }
 
         /**
          * @brief 获取 String 子节点。
          */
-        bool GetChild(NodeString& outChild, TagType tag, size_t index = 0) const {
-            NodeBase base;
-            if (!FindChild(base, tag, index))
-                return false;
-            outChild = base.AsNodeString();
-            return true;
+        NodeString GetChildString(TagType tag, size_t index = 0) const {
+            return FindChild(tag, index).AsNodeString();
         }
 
         /**
          * @brief 获取 Object 子节点。
          */
-        bool GetChild(NodeObject& outChild, TagType tag, size_t index = 0) const {
-            NodeBase base;
-            if (!FindChild(base, tag, index))
-                return false;
-            outChild = base.AsNodeObject();
-            return true;
+        NodeObject GetChildObject(TagType tag, size_t index = 0) const {
+            return FindChild(tag, index).AsNodeObject();
         }
 
     private:
@@ -538,17 +596,17 @@ namespace TLVView {
                 return false;
 
             size_t remaining = m_length - offset;
-            if (remaining < TLVView::TAG_LENGTH + TLVView::LEN_LENGTH)
+            if (remaining < TAG_LENGTH + LEN_LENGTH)
                 return false;
 
-            uint8_t const* p = m_pValue + offset + TLVView::TAG_LENGTH;
+            uint8_t const* p = m_pValue + offset + TAG_LENGTH;
             LengthType childLen = 0;
-            TLVView::BufferReadValue(p, childLen);
+            BufferReadValue(p, childLen);
 
-            if (remaining < TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + childLen)
+            if (remaining < TAG_LENGTH + LEN_LENGTH + childLen)
                 return false;
 
-            offset += TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + childLen;
+            offset += TAG_LENGTH + LEN_LENGTH + childLen;
             return true;
         }
 
@@ -556,37 +614,37 @@ namespace TLVView {
          * @brief 按 tag 匹配子节点，index 指定第几个匹配项（0 基）。
          * @details 仅定位子节点起始位置并构造为 NodeBase（解析 tag + length），
          *          不做类型转换，由调用方通过 AsNodeXxx 转换为具体类型。
+         *          未找到时返回无效态的 NodeBase（IsValid()==false）。
          */
-        bool FindChild(NodeBase& outChild, TagType tag, size_t index) const {
+        NodeBase FindChild(TagType tag, size_t index) const {
             size_t offset = 0;
             size_t matchCount = 0;
 
             while (offset < m_length) {
                 size_t remaining = m_length - offset;
-                if (remaining < TLVView::TAG_LENGTH + TLVView::LEN_LENGTH)
+                if (remaining < TAG_LENGTH + LEN_LENGTH)
                     break;
 
                 uint8_t const* p = m_pValue + offset;
                 TagType childTag = 0;
-                p = TLVView::BufferReadValue(p, childTag);
+                p = BufferReadValue(p, childTag);
                 LengthType childLen = 0;
-                p = TLVView::BufferReadValue(p, childLen);
+                p = BufferReadValue(p, childLen);
 
-                if (remaining < TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + childLen)
+                if (remaining < TAG_LENGTH + LEN_LENGTH + childLen)
                     break;
 
                 if (childTag == tag) {
                     if (matchCount == index) {
-                        size_t nodeTotalLen = TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + childLen;
-                        outChild = NodeBase(m_pValue + offset, nodeTotalLen);
-                        return true;
+                        size_t nodeTotalLen = TAG_LENGTH + LEN_LENGTH + childLen;
+                        return NodeBase(m_pValue + offset, nodeTotalLen);
                     }
                     ++matchCount;
                 }
 
-                offset += TLVView::TAG_LENGTH + TLVView::LEN_LENGTH + childLen;
+                offset += TAG_LENGTH + LEN_LENGTH + childLen;
             }
-            return false;
+            return NodeBase();  // 无效态
         }
     };
 
